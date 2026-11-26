@@ -1,113 +1,75 @@
-name: build
-on: [push, pull_request]
+name: Build Aseprite for Windows
+
+on:
+  push:
+    branches:
+      - 'codex/aseprite-*'
+
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-        build_type: [RelWithDebInfo, Debug]
-        ui: [gui, cli]
-        scripting: [lua, noscripts]
-        exclude:
-          - build_type: Debug
-            ui: gui
-          - build_type: RelWithDebInfo
-            ui: cli
-          - build_type: RelWithDebInfo
-            scripting: noscripts
+    if: github.repository == 'mall1/aseprite'
+    runs-on: windows-2022
+    timeout-minutes: 45
     steps:
-    - uses: actions/checkout@v7
-      with:
-        submodules: 'recursive'
-    - name: Install Dependencies
-      if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y \
-          libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
-          libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
-          libfontconfig1-dev
-    - name: Install Skia
-      if: ${{ matrix.ui == 'gui' }}
-      shell: bash
-      run: |
-        if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          this_dir=$(cygpath "${{ github.workspace }}")
-        else
-          this_dir="${{ github.workspace }}"
-        fi
-        skia_url=$(source $this_dir/laf/misc/skia-url.sh | xargs)
-        skia_file=$(basename $skia_url)
-        curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
-        unzip "$skia_file" -d skia
-    - name: ccache
-      uses: hendrikmuhs/ccache-action@v1.2.23
-      if: ${{ runner.os == 'Linux' || runner.os == 'macOS' }}
-      with:
-        key: ${{ matrix.os }}-${{ matrix.ui }}-${{ matrix.scripting }}-${{ matrix.build_type }}
-    - uses: aseprite/get-ninja@main
-    - uses: TheMrMilchmann/setup-msvc-dev@v4
-      if: runner.os == 'Windows'
-      with:
-        arch: x64
-    - name: Generating Makefiles
-      shell: bash
-      run: |
-        if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          export enable_ccache=off
-        else
-          export enable_ccache=on
-        fi
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
 
-        if [[ "${{ matrix.ui }}" == "gui" ]] ; then
-          export laf_backend=skia
-        else
-          export laf_backend=none
-        fi
+      - uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
 
-        if [[ "${{ matrix.scripting }}" == "lua" ]] ; then
-          export enable_scripting=on
-        else
-          export enable_scripting=off
-        fi
+      - name: Download matching Skia
+        shell: bash
+        run: |
+          skia_url="$(bash laf/misc/skia-url.sh release windows x64)"
+          curl --fail --location --retry 3 --ssl-revoke-best-effort \
+            --output skia.zip "$skia_url"
+          unzip -q skia.zip -d skia
 
-        if [[ "${{ runner.os }}" == "macOS" ]] ; then
-          export skia_arch=arm64
-        else
-          export skia_arch=x64
-        fi
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DENABLE_CCACHE=OFF `
+            -DENABLE_SCRIPTING=ON `
+            -DENABLE_TESTS=OFF `
+            -DLAF_BACKEND=skia `
+            "-DSKIA_DIR=$env:GITHUB_WORKSPACE/skia" `
+            "-DSKIA_LIBRARY_DIR=$env:GITHUB_WORKSPACE/skia/out/Release-x64"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build
 
-        cmake -S . -B build -G Ninja \
-          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14 \
-          -DENABLE_TESTS=ON \
-          -DENABLE_SCRIPTING=$enable_scripting \
-          -DENABLE_CCACHE=$enable_ccache \
-          -DLAF_BACKEND=$laf_backend \
-          -DSKIA_DIR=$(realpath skia) \
-          -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
-    - name: Compiling
-      shell: bash
-      run: |
-        cd build && ninja
-    - name: Running C++ Tests
-      shell: bash
-      run: |
-        if [[ "${{ runner.os }}" == "Linux" ]] ; then
-          export XVFB=xvfb-run
-        fi
-        cd build && $XVFB ctest --output-on-failure
-    - name: Running CLI Tests
-      if: ${{ matrix.scripting == 'lua' }}
-      shell: bash
-      run: |
-        if [[ "${{ runner.os }}" == "Linux" ]] ; then
-          export XVFB=xvfb-run
-        fi
-        export ASEPRITE=$PWD/build/bin/aseprite
-        cd tests
-        $XVFB bash run-tests.sh
+      - name: Check executable and encrypt portable package
+        shell: pwsh
+        working-directory: build/bin
+        env:
+          ASEPRITE_ARTIFACT_PASSWORD: ${{ secrets.ASEPRITE_ARTIFACT_PASSWORD }}
+        run: |
+          if (-not $env:ASEPRITE_ARTIFACT_PASSWORD) {
+            throw 'Set the ASEPRITE_ARTIFACT_PASSWORD repository secret before packaging.'
+          }
+          if (-not (Test-Path -LiteralPath data -PathType Container)) {
+            throw 'The application data directory is missing.'
+          }
+
+          $process = Start-Process -FilePath .\aseprite.exe -ArgumentList '--version' -Wait -NoNewWindow -PassThru
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+
+          # This public repository exposes workflow artifacts to signed-in users.
+          $archive = Join-Path $env:RUNNER_TEMP 'aseprite-windows-x64.7z'
+          & "$env:ProgramFiles\7-Zip\7z.exe" a -mhe=on "-p$env:ASEPRITE_ARTIFACT_PASSWORD" $archive aseprite.exe data
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aseprite-windows-x64-encrypted
+          path: ${{ runner.temp }}/aseprite-windows-x64.7z
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
